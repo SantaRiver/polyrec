@@ -1,3 +1,4 @@
+python-dotenv
 # Polymarket BTC Dashboard - Dependencies
 # Install with: pip install -r requirements.txt
 

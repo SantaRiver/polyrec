@@ -4,11 +4,20 @@ Terminal dashboard that aggregates:
 - BN: Binance btcusdt 1s kline price + 1s/5s quote volumes.
 - PM: Polymarket best asks for UP/DOWN (BTC 15m market).
 
+ALERT SYSTEM (NEW):
+- Monitors arbitrage opportunities in real-time
+- Triggers alerts when arbitrage > threshold (default 2%)
+- Supports: Sound alerts, Telegram notifications, console alerts, logging
+- Configure: Edit alert_threshold in main() or set TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID env vars
+
 Requirements:
   pip install requests websocket-client
 
 Run:
   python dash.py
+  
+Alert logs saved to: ./alerts.log
+CSV data logs saved to: ./logs/
 """
 
 import csv
@@ -29,6 +38,14 @@ from zoneinfo import ZoneInfo
 
 import requests
 import websocket
+
+# ---- Alert System ----
+try:
+    from alert_system import AlertSystem
+    ALERTS_ENABLED = True
+except ImportError:
+    ALERTS_ENABLED = False
+    print("⚠️  Alert system not found. Install alert_system.py to enable alerts.")
 
 # ---- Chainlink (CL) ----
 CL_URL = "wss://ws-live-data.polymarket.com"
@@ -97,6 +114,9 @@ stop_event = threading.Event()
 ws_binance = None
 ws_polymarket = None
 cl_process = None
+
+# Global alert system
+alert_system = None
 
 
 # ---- Data Logger
@@ -1122,8 +1142,20 @@ def render_loop():
             f"OB SLOPE  │ UP: Bid:{up_bid_slope_str:>5} Ask:{up_ask_slope_str:>5} │ DN: Bid:{down_bid_slope_str:>5} Ask:{down_ask_slope_str:>5}  (>0.6=wall)",
             f"EAT-FLOW/s│ UP: Bid:{up_bid_eat_str:>6} Ask:{up_ask_eat_str:>6}",
             f"          │ DN: Bid:{down_bid_eat_str:>6} Ask:{down_ask_eat_str:>6}  (negative=eaten)",
-            "",
         ]
+        
+        # Add alert statistics if enabled
+        if ALERTS_ENABLED and alert_system:
+            alert_stats = alert_system.get_stats()
+            if alert_stats['total_alerts'] > 0:
+                lines.append(f"ALERTS    │ Total: {alert_stats['total_alerts']:>3} │ "
+                           f"Avg: {alert_stats['avg_arb']:>5.2f}% │ "
+                           f"Max: {alert_stats['max_arb']:>5.2f}% │ "
+                           f"Last: {alert_stats['last_alert_time']}")
+            else:
+                lines.append(f"ALERTS    │ No alerts triggered yet (threshold: {alert_system.arb_threshold*100:.1f}%)")
+        
+        lines.append("")
         
         # Build ORDERBOOK block (left side)
         orderbook_block = []
@@ -1177,6 +1209,28 @@ def render_loop():
             edge = 1.0 - level_sum
             bid_level_sums.append((level_sum, edge))
         
+        # ---- ALERT CHECK: Arbitrage opportunity ----
+        if ALERTS_ENABLED and alert_system and bid_level_sums:
+            arb_l1 = bid_level_sums[0][1]  # First level edge (1.0 - sum)
+            
+            if arb_l1 > alert_system.arb_threshold:
+                # Prepare market data for alert
+                market_data = {
+                    'up_bid': up_bids[0][0] if up_bids else 0.0,
+                    'down_bid': down_bids[0][0] if down_bids else 0.0,
+                    'seconds_till_end': market_seconds_left,
+                    'volume_spike': bn_volume_spike if bn_volume_spike else 0.0,
+                    'atr_5s': bn_atr5s if bn_atr5s else 0.0,
+                    'up_imbalance': up_imbalance if up_imbalance is not None else 0.0,
+                    'down_imbalance': down_imbalance if down_imbalance is not None else 0.0,
+                }
+                
+                # Trigger alert
+                alert_system.trigger_alert(
+                    arb_value=arb_l1,
+                    market_data=market_data
+                )
+        
         # Build depth metrics columns
         up_depth_lines = []
         up_depth_lines.append("UP│Bid:{:>4} Ask:{:>4}".format(int(up_bid_depth5), int(up_ask_depth5)))
@@ -1218,6 +1272,20 @@ def main():
         print("\nStopping...")
         stop_event.set()
         
+        # Print final alert statistics
+        if ALERTS_ENABLED and alert_system:
+            stats = alert_system.get_stats()
+            if stats['total_alerts'] > 0:
+                print("\n" + "="*60)
+                print("📊 ALERT STATISTICS")
+                print("="*60)
+                print(f"Total alerts: {stats['total_alerts']}")
+                print(f"Average arbitrage: {stats['avg_arb']:.2f}%")
+                print(f"Maximum arbitrage: {stats['max_arb']:.2f}%")
+                print(f"Minimum arbitrage: {stats['min_arb']:.2f}%")
+                print(f"Alerts saved to: {alert_system.log_file}")
+                print("="*60)
+        
         # Close all websockets and subprocess
         if ws_binance:
             try:
@@ -1240,6 +1308,22 @@ def main():
     # Initialize data logger
     global logger
     logger = DataLogger(output_dir="./logs")
+    
+    # Initialize alert system
+    global alert_system
+    if ALERTS_ENABLED:
+        alert_system = AlertSystem(
+            arb_threshold=0.02,           # 2% arbitrage threshold
+            enable_sound=True,            # Sound alerts
+            enable_telegram=True,        # Telegram alerts (set to True if configured)
+            enable_console=True,          # Console alerts
+            log_file='./alerts.log'       # Alert log file
+        )
+        print("✅ Alert system initialized (threshold: 2.0%)")
+        print("   Configure Telegram: Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars")
+    else:
+        print("⚠️  Alert system disabled (alert_system.py not found)")
+
 
     threads = [
         threading.Thread(target=chainlink_worker, daemon=True),
